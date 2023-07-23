@@ -58,6 +58,83 @@ EOF
 mkdir -p "${KUBECONFIG_SRC_DIR}" "${KUBECONFIG_DEST_DIR}"
 chmod 744 "${KUBECONFIG_SRC_DIR}" "${KUBECONFIG_DEST_DIR}"
 
+_kube_print_list() {
+    IFS=$'\n\t'
+
+    local yellow darkbg normal
+    yellow=$(tput setaf 3 || true)
+    darkbg=$(tput setab 0 || true)
+    normal=$(tput sgr0 || true)
+
+    local cur_item_fg cur_item_bg
+    cur_item_fg=${KUBECTX_CURRENT_FGCOLOR:-$yellow}
+    cur_item_bg=${KUBECTX_CURRENT_BGCOLOR:-$darkbg}
+
+    local item items_list
+
+    cur_item=${1}
+    if [ -n "$ZSH_VERSION" ]; then
+        eval "items_list=(${2})"
+    else
+        items_list=${2}
+    fi
+
+    for item in $items_list; do
+        if [[ -n "${_KUBECTX_FORCE_COLOR:-}" || \
+            -t 1 && -z "${NO_COLOR:-}" ]]; then
+            # colored output mode
+            if [[ "${item}" = "${cur_item}" ]]; then
+                echo "${cur_item_bg}${cur_item_fg}${item}${normal}"
+            else
+                echo "${item}"
+            fi
+        else
+            echo "${item}"
+        fi
+    done
+}
+
+_kube_current_context() {
+    kubectl config view -o=jsonpath='{.current-context}'
+}
+
+_kube_get_contexts() {
+    #kubectl config get-contexts --kubeconfig=${kube_config_file_org} -o=name | sort -n
+    KUBECONFIG=$(_kube_config) kubectl config get-contexts --no-headers=true -o name
+}
+
+_kube_list_contexts() {
+    local cur_ctx kube_contexts_all
+    cur_ctx="$(_kube_current_context)" || exit_err "error getting current context"
+    kube_contexts_all=$(_kube_get_contexts) || exit_err "error getting context list"
+    _kube_print_list ${cur_ctx} ${kube_contexts_all}
+}
+
+_kube_current_namespace() {
+    local cur_ctx
+
+    cur_ctx="$(_kube_current_context)" || exit_err "error getting current context"
+    ns="$(kubectl config view -o=jsonpath="{.contexts[?(@.name==\"${cur_ctx}\")].context.namespace}")" \
+        || exit_err "error getting current namespace"
+
+    if [[ -z "${ns}" ]]; then
+        echo "default"
+    else
+        echo "${ns}"
+    fi
+}
+
+_kube_get_namespaces() {
+    kubectl get namespaces -o=jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'
+    #kubectl get namespaces -o=jsonpath='{range .items[*].metadata.name}{@}{"\n"}{end}'
+}
+
+_kube_list_namespaces() {
+    local cur_ns kube_namespace_all
+    cur_ns="$(_kube_current_namespace)" || exit_err "error getting current namespace"
+    kube_namespace_all=$(_kube_get_namespaces) || exit_err "error getting namespace list"
+    _kube_print_list ${cur_ns} ${kube_namespace_all}
+}
 
 #
 # Handeling Kube config files.
@@ -88,7 +165,6 @@ _kube_config () {
     fi
 }
 
-
 #
 # Remove non-alphanumeric characters in kubeconfig filename for certain kube context.
 _kube_context_filename () {
@@ -98,7 +174,6 @@ _kube_context_filename () {
 
   echo "${kube_context_filename}-${kube_namespace}.yaml"
 }
-
 
 #
 # Generate kubectl config for a single context.
@@ -118,7 +193,6 @@ _kubechg () {
         "${KUBECONFIG_DEST_DIR}/${kubeconfig_file}"
 }
 
-
 #
 # Change kubectl context.
 kubechc () {
@@ -129,53 +203,43 @@ kubechc () {
         _kubechg "${kube_context}" "${kube_namespace}"
         _kube_config "${KUBECONFIG_DEST_DIR}/$(_kube_context_filename "${kube_context}" "${kube_namespace}")"
         # kubectl config current-context
+        kubectl config set-context --current --namespace="${kube_namespace}"
+        echo "Switched to namespace \"${kube_namespace}\""
     else
-        KUBECONFIG=$(_kube_config) kubectl config get-contexts --no-headers=true -o name
+        #KUBECONFIG=$(_kube_config) kubectl config get-contexts --no-headers=true -o name
+        _kube_list_contexts
     fi
 }
-
-alias kchc='kubechc'
-
 
 #
 # Change kubectl namespace
 kubechn () {
-    kube_namespace="${1:-default}"
-    if [[ "${KUBECH_NAMESPACE_CHECK}" == "label" ]]; then
-        kube_namespace_exists=$(kubectl get namespaces -l "kubernetes.io/metadata.name=${kube_namespace}" -o name)
-    else
-        kube_namespace_all=$(kubectl get namespaces -o=jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
-        kube_namespace_exists=$(echo "${kube_namespace_all}" | grep -E "^${kube_namespace}$")
-    fi
-
     if [[ -n ${1} ]]; then
+        kube_namespace="${1}"
+
+        if [[ "${KUBECH_NAMESPACE_CHECK}" == "label" ]]; then
+            kube_namespace_exists=$(kubectl get namespaces -l "kubernetes.io/metadata.name=${kube_namespace}" -o name)
+        else
+            kube_namespace_all=$(_kube_get_namespaces)
+            kube_namespace_exists=$(echo "${kube_namespace_all}" | grep -E "^${kube_namespace}$")
+        fi
+
         # Only switch namespace if it exists.
         if [[ -n "${kube_namespace_exists}" ]]; then
-            kubechc "$(kubectl config current-context)" "${kube_namespace}"
-            kubectl config set-context --current --namespace="${kube_namespace}"
-            echo "Switched to namespace \"${kube_namespace}\""
+            kubechc "$(_kube_current_context)" "${kube_namespace}"
         else
             echo "The namespace \"${kube_namespace}\" doesn't exist"
         fi
     else
-        if [[ -n "${kube_namespace_all}" ]]; then
-            echo "${kube_namespace_all}" 
-        else
-            kubectl get namespaces -o=jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'
-        fi
+        _kube_list_namespaces
     fi
 }
-
-alias kchn='kubechn'
-
 
 #
 # Unset the active context.
 kubechu () {
     kubectl config unset current-context
 }
-
-alias kchu='kubechu'
 
 #
 # Remove auto-generated kubeconf files from kubech dist dir.
@@ -184,6 +248,9 @@ kubechr () {
     rm "${KUBECONFIG_DEST_DIR}"/*.yaml
 }
 
+alias kchc='kubechc'
+alias kchn='kubechn'
+alias kchu='kubechu'
 alias kchr='kubechr'
 
 #
